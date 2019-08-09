@@ -1,0 +1,546 @@
+/*
+  -----------------------------------------|
+          Configuração dos Pinos           |
+         ########################          |
+      TX  -> ############################  |
+      RX  -> ############################  |
+      D2  -> Botões dos Semáforos          |
+  PWM D3  -> Led Verde dos Peões           |
+      D4  -> ############################  |
+  PWM D5  -> Led Vermelho dos Peões        |
+  PWM D6  -> Led Vermelho dos Veículos     |
+      D7  -> Trig do Sensor de Distância1  |
+      D8  -> Echo do Sensor de Distância1  |
+  PWM D9  -> Led Amarelo dos Veículos      |
+  PWM D10 -> Led Verde dos Veículos        |
+  PWM D11 -> Trig do Sensor de Distância2  |
+      D12 -> Echo do Sensor de Distância2  |
+      D13 -> DHT22                         |
+      A0  -> ############################  |
+      A1  -> Buzzer1                       |
+      A2  -> Buzzer2                       |
+      A3  -> Resistência LDR               |
+      A4  -> SDA LCD                       |
+      A5  -> SCL LCD                       |
+      A6  -> ############################  |
+      A7  -> ############################  |
+  -----------------------------------------|
+*/
+// Bibliotecas Utilizadas
+#include <DHT.h>;               // Sensor de temperatura e humidade
+#include <Ultrasonic.h>         // Sensor de distância
+#include <Wire.h>               // LCD
+#include <LiquidCrystal_I2C.h>  // LCD
+#include <Time.h>               // Data e Hora
+#include <TimeLib.h>            // Data e Hora
+
+// Leds dos Peões
+#define PEAO_RED 5
+#define PEAO_GREEN 3
+
+// Leds dos Veículos
+#define CAR_RED 6
+#define CAR_YELLOW 9
+#define CAR_GREEN 10
+
+// Botões
+#define botao 2
+
+// DHT22
+#define DHTPIN 13
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE); //Inicia o sensor para o Arduino normal de 16mhz
+
+// Buzzers
+#define buzzer1 A1
+#define buzzer2 A2
+
+// Sensores de Distância
+#define trigger1 7
+#define echo1 8
+Ultrasonic sensorD1(trigger1, echo1);
+#define trigger2 11
+#define echo2 12
+Ultrasonic sensorD2(trigger2, echo2);
+int alerta = 5000;
+
+// Resistência LDR
+#define ldr A3
+
+// Delay 1
+unsigned long tempoAtual;
+unsigned long proximaParagem = 10;
+unsigned long ultimaParagem = 0;
+
+// Delay 2
+unsigned long esperar = 10;
+unsigned long paragem = 0;
+
+// Delay 3
+unsigned long proximoIntervalo = 10;
+unsigned long ultimoIntervalo = 0;
+
+// Intervalos dos delays
+int intervalo[] = {10000, 5000, 2000, 500, 1000};
+
+// Variáveis para controlar o ciclo de pedido automático para peões
+unsigned long ciclo = 15000;
+unsigned long ultimoCiclo = 10;
+unsigned long automatico;
+
+// Som de aviso para peões/pedestres
+const byte NOTE_A6 = 1760;
+
+// LCD (Inicia o display no endereco 0x27)
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// Mensagens de aviso LCD
+char *frase[] = {"Modere a velocidade!", " Piso escorregadio!", "Em caso de incendio   ligue para o 112", " Pouca visibilidade"};
+
+// Globais
+int hum;                                  //Humidade
+float temp;                               //Temperatura
+int fase = 0;                             //Variável para passar à próxima fase do programa
+int estado = -1;                          //Variável utilizada no delay do lcd
+
+// Variáveis para suavizar as leituras
+const int numLeituras = 10;               //Numero de leituras
+int leituras[numLeituras];                //Quantidade de de amostras
+int index = 0;                            //Índice da leitura atual
+int total = 0;                            //Total
+int media = 0;                            //Média
+
+// Tempo do debounce em milisegundos para o botão
+long debouncing_time = 2000;
+volatile unsigned long last_micros;
+
+// Configuração dos buzzers
+void playTone(byte pin, int tone, int duration) {
+  for (long i = 0; i < duration * 1000L; i += tone * 2) {
+    digitalWrite(pin, HIGH);
+    delayMicroseconds(tone);
+    digitalWrite(pin, LOW);
+    delayMicroseconds(tone);
+  }
+}
+
+// Variáveis para contar os veículos
+int contador = 0;
+int count = 0;
+int atual = 0;
+///////////////////////////////////////////////////////////////////////////////////////////
+void setup() {
+  // Inicia o monitor série
+  Serial.begin(9600);
+
+  // Inicia o sensor de temperatura e humidade
+  dht.begin();
+
+  // Inicia o LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+
+  // Semaforo peões
+  pinMode(PEAO_RED, OUTPUT);
+  pinMode(PEAO_GREEN, OUTPUT);
+
+  // Semaforo veículos
+  pinMode(CAR_RED, OUTPUT);
+  pinMode(CAR_GREEN, OUTPUT);
+  pinMode(CAR_YELLOW, OUTPUT);
+
+  // Botões peões
+  pinMode(botao, INPUT);
+
+  // Buzzers
+  pinMode(buzzer1, OUTPUT);
+  pinMode(buzzer2, OUTPUT);
+
+  // Inicia todas as Leituras com 0
+  for (int i = 0; i < numLeituras; i++)
+    leituras[i] = 0;
+
+  // Define a Hora e Data (hh,mm,ss,dd,mm,aa);
+  setTime(12, 051, 00, 17, 01, 2019);
+
+  // Interrupt do botão
+  attachInterrupt(digitalPinToInterrupt(2), debounceInterrupt, RISING);
+}
+///////////////////////////////////////////////////////////////////////////////////////////
+void loop() {
+  tempoAtual = millis();
+  automatico = millis();
+
+  sensorLDR();
+
+  if (tempoAtual - ultimoIntervalo >= proximoIntervalo) {
+    ultimoIntervalo = tempoAtual;
+    sensorDistancia2();
+  }
+  if (tempoAtual - ultimaParagem >= proximaParagem) {
+    ultimaParagem = tempoAtual;
+    lcdInfo();
+    dht22();
+  }
+  if (tempoAtual - paragem > esperar) {
+    paragem = tempoAtual;
+    semaforos();
+  }
+  delay(500);
+}
+///////////////////////////////////////////////////////////////////////////////////////////
+/*
+   Interrupt para o botão
+*/
+void debounceInterrupt() {
+  //  Serial.println(millis());
+  if (millis() - last_micros >= debouncing_time) {
+    //    Serial.println("debounce");
+    Interrupt();
+    last_micros = millis();
+  }
+}
+
+void Interrupt() {
+  Serial.print("[Debug     botao] ");
+  Serial.println("Botao Pressionado!");
+  if (fase == 2) {
+    esperar = intervalo[4];
+    fase++;
+  }
+}
+///////////////////////////////////////////////////////////////////////////////////////////
+/*
+   Código dos semáforos
+*/
+void semaforos() {
+  if (fase == 0) {
+    //O semáforo acende vermelho para peões e verde para veículos ao iniciar o programa
+    leds();
+    fase++;
+  } else if (fase == 1) {
+    //Vermelho para peões
+    Serial.print("[Debug semaforos] ");
+    Serial.println("Sinal vermelho para peoes!");
+    digitalWrite(PEAO_GREEN, LOW);
+    analogWrite(PEAO_RED, media);
+    Serial.print("[Debug      fase] ");
+    Serial.println(fase);
+    esperar = intervalo[4];
+    alerta = 5000;
+    fase++;
+    if (automatico >= 20000) ultimoCiclo = automatico;
+  } else if (fase == 2) {
+    //Verde para veículos
+    //Função para mostrar apenas uma vez
+    if (alerta < 5001) {
+      Serial.print("[Debug semaforos] ");
+      Serial.println("Sinal verde para veiculos!");
+      Serial.print("[Debug      fase] ");
+      Serial.println(fase);
+      alerta = alerta + 1;
+    }
+    digitalWrite(CAR_RED, LOW);
+    digitalWrite(CAR_YELLOW, LOW);
+    analogWrite(CAR_GREEN, media);
+    sensorDistancia1();
+    atual = 1;
+    if (automatico - ultimoCiclo  >= ciclo) {
+      Serial.print("[Debug semaforos] ");
+      Serial.println("Ciclo automatico dos semaforos!");
+      fase++;
+    }
+  } else if (fase == 3) {
+    //Verde para veículos mais 2 segundos
+    analogWrite(CAR_GREEN, media);
+    digitalWrite(CAR_YELLOW, LOW);
+    digitalWrite(CAR_RED, LOW);
+    Serial.print("[Debug      fase] ");
+    Serial.println(fase);
+    esperar = intervalo[2];
+    fase++;
+  } else if (fase == 4) {
+    //Amarelo para veículos
+    Serial.print("[Debug semaforos] ");
+    Serial.println("Sinal amarelo para veiculos!");
+    digitalWrite(CAR_GREEN, LOW);
+    analogWrite(CAR_YELLOW, media);
+    digitalWrite(CAR_RED, LOW);
+    Serial.print("[Debug      fase] ");
+    Serial.println(fase);
+    esperar = intervalo[4];
+    fase++;
+    atual = 0;
+  } else if (fase == 5) {
+    //Vermelho para veículos
+    Serial.print("[Debug semaforos] ");
+    Serial.println("Sinal vermelho para veiculos!");
+    digitalWrite(CAR_GREEN, LOW);
+    digitalWrite(CAR_YELLOW, LOW);
+    analogWrite(CAR_RED, media);
+    Serial.print("[Debug      fase] ");
+    Serial.println(fase);
+    esperar = intervalo[4];
+    alerta = 1;
+    fase++;
+  } else if (fase == 6) {
+    //Verde para peões
+    Serial.print("[Debug semaforos] ");
+    Serial.println("Sinal verde para peoes!");
+    digitalWrite(PEAO_RED, LOW);
+    analogWrite(PEAO_GREEN, media);
+    Serial.print("[Debug      fase] ");
+    Serial.println(fase);
+    esperar = intervalo[0];
+    fase++;
+  } else if (fase == 7) {
+    //Faltam 5 segundos para o tempo dos peões terminar
+    //Envia sinal sonoro meio segundo
+    Serial.print("[Debug semaforos] ");
+    Serial.println("Faltam 5segundos!");
+    digitalWrite(PEAO_RED, LOW);
+    digitalWrite(PEAO_GREEN, LOW);
+    playTone(buzzer1, 1000, 500);
+    Serial.print("[Debug      fase] ");
+    Serial.println(fase);
+    esperar = intervalo[3];
+    fase++;
+  } else if (fase == 8) {
+    //Para sinal sonoro
+    digitalWrite(PEAO_RED, LOW);
+    analogWrite(PEAO_GREEN, media);
+    Serial.print("[Debug      fase] ");
+    Serial.println(fase);
+    esperar = intervalo[3];
+    fase++;
+  } else if (fase == 9) {
+    //Envia sinal sonoro meio segundo
+    digitalWrite(PEAO_RED, LOW);
+    digitalWrite(PEAO_GREEN, LOW);
+    playTone(buzzer1, 1000, 500);
+    Serial.print("[Debug      fase] ");
+    Serial.println(fase);
+    esperar = intervalo[3];
+    fase++;
+  } else if (fase == 10) {
+    //Para sinal sonoro
+    digitalWrite(PEAO_RED, LOW);
+    analogWrite(PEAO_GREEN, media);
+    Serial.print("[Debug      fase] ");
+    Serial.println(fase);
+    esperar = intervalo[3];
+    fase++;
+  } else if (fase == 11) {
+    //Envia sinal sonoro meio segundo
+    digitalWrite(PEAO_RED, LOW);
+    digitalWrite(PEAO_GREEN, LOW);
+    playTone(buzzer1, 1000, 500);
+    Serial.print("[Debug      fase] ");
+    Serial.println(fase);
+    esperar = intervalo[3];
+    fase++;
+  } else if (fase == 12) {
+    //Para sinal sonoro
+    digitalWrite(PEAO_RED, LOW);
+    analogWrite(PEAO_GREEN, media);
+    Serial.print("[Debug      fase] ");
+    Serial.println(fase);
+    esperar = intervalo[3];
+    fase++;
+  } else if (fase == 13) {
+    //Envia sinal sonoro meio segundo
+    digitalWrite(PEAO_RED, LOW);
+    digitalWrite(PEAO_GREEN, LOW);
+    playTone(buzzer1, 1000, 500);
+    Serial.print("[Debug      fase] ");
+    Serial.println(fase);
+    esperar = intervalo[3];
+    fase++;
+  } else if (fase == 14) {
+    //Para sinal sonoro
+    digitalWrite(PEAO_RED, LOW);
+    analogWrite(PEAO_GREEN, media);
+    Serial.print("[Debug      fase] ");
+    Serial.println(fase);
+    esperar = intervalo[3];
+    fase++;
+  } else if (fase == 15) {
+    //Envia sinal sonoro meio segundo
+    digitalWrite(PEAO_RED, LOW);
+    digitalWrite(PEAO_GREEN, LOW);
+    playTone(buzzer1, 1000, 500);
+    Serial.print("[Debug      fase] ");
+    Serial.println(fase);
+    esperar = intervalo[3];
+    fase++;
+  } else if (fase == 16) {
+    //Para sinal sonoro
+    //Volta ao inicio do ciclo
+    digitalWrite(PEAO_RED, LOW);
+    analogWrite(PEAO_GREEN, media);
+    Serial.print("[Debug      fase] ");
+    Serial.println(fase);
+    esperar = intervalo[3];
+    fase = 1;
+  }
+}
+///////////////////////////////////////////////////////////////////////////////////////////
+/*
+   Inicia os leds dos peões vermelho e dos veículos verde
+*/
+void leds() {
+  digitalWrite(PEAO_GREEN, LOW);
+  analogWrite(PEAO_RED, media);
+  analogWrite(CAR_GREEN, media);
+  digitalWrite(CAR_YELLOW, LOW);
+  digitalWrite(CAR_RED, LOW);
+}
+///////////////////////////////////////////////////////////////////////////////////////////
+/*
+   Sensor de temperatura e humidade
+*/
+void dht22() {
+  //Lê e guarda os valores nas variáveis hum e temp
+  hum = dht.readHumidity();
+  temp = dht.readTemperature();
+  //Envia os valores da temperatura e humidade para o monitor série
+  //  Serial.print("Humidade: ");
+  //  Serial.print(hum);
+  //  Serial.print(" %, Temperatura: ");
+  //  Serial.print(temp);
+  //  Serial.println(" Celsius");
+  //  Serial.println("");
+}
+///////////////////////////////////////////////////////////////////////////////////////////
+/*
+   Sensor de distância para pedir permissão para os peões
+*/
+void sensorDistancia1() {
+  //Lê as informações do sensor em cm
+  float distancia1;
+  long microsec1 = sensorD1.timing();
+  distancia1 = sensorD1.convert(microsec1, Ultrasonic::CM);
+  //  Serial.print("Distancia1: ");
+  //  Serial.print(distancia1);
+  //  Serial.println("cm");
+
+  if (distancia1 <= 10) {
+    Serial.print("[Debug semaforos] ");
+    Serial.println("Peão perto do semaforo!");
+    fase++;
+    esperar = intervalo[2];
+  }
+}
+
+/*
+   Sensor de distância para contar carros
+*/
+void sensorDistancia2() {
+  //Lê as informações do sensor em cm
+  long distancia2;
+  long microsec2 = sensorD2.timing();
+  distancia2 = sensorD2.convert(microsec2, Ultrasonic::CM);
+  //    Serial.print("Distancia2: ");
+  //    Serial.print(distancia2);
+  //    Serial.println("cm");
+  //    Serial.println("");
+
+  if (distancia2 * alerta <= 100) {
+    playTone(buzzer2, 2000, 500);
+    Serial.print("[Debug semaforos] ");
+    Serial.println("Veiculo passou o sinal vermelho!");
+    Serial.print("[Debug distancia] ");
+    Serial.print(distancia2);
+    Serial.println("cm");
+    proximoIntervalo = intervalo[1];
+  }
+  if (distancia2 <= 100 && atual == 1) {
+    contador = contador + 1;
+    Serial.print("[Debug  contador] ");
+    Serial.println(contador);
+    proximoIntervalo = intervalo[3];
+  }
+}
+///////////////////////////////////////////////////////////////////////////////////////////
+/*
+   Sensor LDR para controlar a luminusidade dos semáforos
+*/
+void sensorLDR() {
+  // Para suavizar a leitura dos valores
+  total -= leituras[index];               //Subtrair a última leitura
+  leituras[index] = analogRead(ldr);      //Ler o sensor
+  total += leituras[index];               //Adicionar a leitura ao total
+  index = (index + 1);                    //Avançar para o próximo índice
+
+  if (index >= numLeituras)
+    index = 0;                            //Volta a contar desde o início
+
+  media = total / numLeituras;            //Calcula a média
+  //  Serial.println(media);              //Envia para a porta Série
+
+  media = constrain(media, 900, 1010);
+  media = map(media, 900, 1010, 255, 0);
+  //  Serial.print("Sensor LDR: ");
+  //  Serial.println(media);
+  //  Serial.println("");
+  if (media <= 5) media = 5;              //Pára a oscilação da resistência entre 0 e 5
+}
+///////////////////////////////////////////////////////////////////////////////////////////
+/*
+   Informação que o LCD mostra
+*/
+void lcdInfo() {
+  // Ecrã principal do lcd
+  int r = random(4);
+  if (estado == -1) {
+    lcd.setCursor(0, 1);
+    lcd.print("A inicar sistema...");
+    proximaParagem = intervalo[2];
+    estado++;
+  } else if (estado == 0) {
+    // Data
+    lcd.clear();
+    lcd.setCursor(5, 0);
+    if (day() < 10)lcd.print("0");
+    lcd.print(day());                     //Dia
+    lcd.print("/");
+    if (month() < 10)lcd.print("0");
+    lcd.print(month());                   //Mês
+    lcd.print("/");
+    if (year() < 10)lcd.print("0");
+    lcd.print(year());                    //Ano
+
+    // Hora
+    lcd.setCursor(15, 5);
+    if (hour() < 10)lcd.print("0");
+    lcd.print(hour());                    //Horas
+    lcd.print(":");
+    if (minute() < 10)lcd.print("0");
+    lcd.print(minute());                  //Minutos
+
+    // Temperatura
+    lcd.setCursor(0, 1);
+    lcd.print("Temp: ");
+    lcd.print(temp, 1);                   //Temperatura com 1 casa decimal
+    lcd.print("\337C ");
+    // Humidade
+    lcd.setCursor(0, 2);
+    lcd.print("Hum : ");
+    lcd.print(hum);                       //Humidade
+    lcd.print("%");
+
+    proximaParagem = intervalo[0];
+    estado++;
+  } else if (estado == 1) {
+    // Mensagem aleatória
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("*******AVISO********");
+    lcd.setCursor(0, 1);
+    lcd.print(frase[r]);
+    proximaParagem = intervalo[0];
+    estado = 0;
+  }
+}
+///////////////////////////////////////////////////////////////////////////////////////////
